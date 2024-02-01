@@ -94,6 +94,155 @@ module MemoWise
   end
   private_constant(:CreateMemoWiseStateOnInherited)
 
+  module MemoWiseClassMethods
+    # Allocator to set up memoization state before
+    # [calling the original](https://medium.com/@jeremy_96642/ruby-method-auditing-using-module-prepend-4f4e69aacd95)
+    # allocator.
+    #
+    # This is necessary in addition to the `#initialize` method definition
+    # above because
+    # [`Class#allocate`](https://ruby-doc.org/3.2.2/Class.html#method-i-allocate)
+    # bypasses `#initialize`, and when it's used (e.g.,
+    # [in ActiveRecord](https://github.com/rails/rails/blob/a395c3a6af1e079740e7a28994d77c8baadd2a9d/activerecord/lib/active_record/persistence.rb#L411))
+    # we still need to be able to access MemoWise's instance variable. Despite
+    # Ruby documentation indicating otherwise, `Class#new` does not call
+    # `Class#allocate`, so we need to override both.
+    #
+    def allocate
+      MemoWise::InternalAPI.create_memo_wise_state!(super)
+    end
+
+    # NOTE: See YARD docs for {.memo_wise} directly below this method!
+    def memo_wise(method_name_or_hash)
+      klass = self
+      case method_name_or_hash
+      when Symbol
+        method_name = method_name_or_hash
+
+        if klass.singleton_class?
+          MemoWise::InternalAPI.create_memo_wise_state!(
+            MemoWise::InternalAPI.original_class_from_singleton(klass)
+          )
+        end
+
+        # Ensures a module extended by another class/module still works
+        # e.g. rails `ClassMethods` module
+        if klass.is_a?(Module) && !klass.is_a?(Class)
+          # Using `extended` without `included` & `prepended`
+          # As a call to `create_memo_wise_state!` is already included in
+          # `.allocate`/`#initialize`
+          #
+          # But a module/class extending another module with memo_wise
+          # would not call `.allocate`/`#initialize` before calling methods
+          #
+          # On method call `@_memo_wise` would still be `nil`
+          # causing error when fetching cache from `@_memo_wise`
+          klass.singleton_class.prepend(CreateMemoWiseStateOnExtended)
+        end
+      when Hash
+        unless method_name_or_hash.keys == [:self]
+          raise ArgumentError,
+                "`:self` is the only key allowed in memo_wise"
+        end
+
+        method_name = method_name_or_hash[:self]
+
+        MemoWise::InternalAPI.create_memo_wise_state!(self)
+
+        # In Ruby, "class methods" are implemented as normal instance methods
+        # on the "singleton class" of a given Class object, found via
+        # {Class#singleton_class}.
+        # See: https://medium.com/@leo_hetsch/demystifying-singleton-classes-in-ruby-caf3fa4c9d91
+        klass = klass.singleton_class
+      end
+
+      # This ensures that a memoized method defined on a parent class can
+      # still be used in a child class.
+      if klass.is_a?(Class) && !klass.singleton_class?
+        klass.singleton_class.prepend(CreateMemoWiseStateOnInherited)
+      else
+        klass.prepend(CreateMemoWiseStateOnInherited)
+      end
+
+      raise ArgumentError, "#{method_name.inspect} must be a Symbol" unless method_name.is_a?(Symbol)
+
+      visibility = MemoWise::InternalAPI.method_visibility(klass, method_name)
+      original_memo_wised_name = MemoWise::InternalAPI.original_memo_wised_name(method_name)
+      method = klass.instance_method(method_name)
+
+      klass.send(:alias_method, original_memo_wised_name, method_name)
+      klass.send(:private, original_memo_wised_name)
+
+      method_arguments = MemoWise::InternalAPI.method_arguments(method)
+
+      case method_arguments
+      when MemoWise::InternalAPI::NONE
+        klass.module_eval <<~HEREDOC, __FILE__, __LINE__ + 1
+          def #{method_name}
+            @_memo_wise.fetch(:#{method_name}) do
+              @_memo_wise[:#{method_name}] = #{original_memo_wised_name}
+            end
+          end
+        HEREDOC
+      when MemoWise::InternalAPI::ONE_REQUIRED_POSITIONAL, MemoWise::InternalAPI::ONE_REQUIRED_KEYWORD
+        key = method.parameters.first.last
+        klass.module_eval <<~HEREDOC, __FILE__, __LINE__ + 1
+          def #{method_name}(#{MemoWise::InternalAPI.args_str(method)})
+            _memo_wise_hash = (@_memo_wise[:#{method_name}] ||= {})
+            _memo_wise_hash.fetch(#{key}) do
+              _memo_wise_hash[#{key}] = #{original_memo_wised_name}(#{MemoWise::InternalAPI.call_str(method)})
+            end
+          end
+        HEREDOC
+      when MemoWise::InternalAPI::MULTIPLE_REQUIRED
+        # When we have multiple required params, we store the memoized values in a deeply nested hash, like:
+        # { method_name: { arg1 => { arg2 => { arg3 => memoized_value } } } }
+        last_index = method.parameters.size
+        layers = method.parameters.map.with_index(1) do |(_, name), index|
+          prev_hash = "_memo_wise_hash#{index - 1 if index > 1}"
+          fallback = if index == last_index
+                       "#{original_memo_wised_name}(#{MemoWise::InternalAPI.call_str(method)})"
+                     else
+                       "{}"
+                     end
+          "_memo_wise_hash#{index} = #{prev_hash}.fetch(#{name}) { #{prev_hash}[#{name}] = #{fallback} }"
+        end
+        klass.module_eval <<~HEREDOC, __FILE__, __LINE__ + 1
+          def #{method_name}(#{MemoWise::InternalAPI.args_str(method)})
+            _memo_wise_hash = (@_memo_wise[:#{method_name}] ||= {})
+            #{layers.join("\n  ")}
+          end
+        HEREDOC
+      when MemoWise::InternalAPI::SPLAT_AND_DOUBLE_SPLAT
+        # When we have both *args and **kwargs, we store the memoized values in a deeply nested hash, like:
+        # { method_name: { args => { kwargs => memoized_value } } }
+        klass.module_eval <<~HEREDOC, __FILE__, __LINE__ + 1
+          def #{method_name}(*args, **kwargs)
+            _memo_wise_hash = (@_memo_wise[:#{method_name}] ||= {})
+            _memo_wise_kwargs_hash = _memo_wise_hash.fetch(args) do
+              _memo_wise_hash[args] = {}
+            end
+            _memo_wise_kwargs_hash.fetch(kwargs) do
+              _memo_wise_kwargs_hash[kwargs] = #{original_memo_wised_name}(#{MemoWise::InternalAPI.call_str(method)})
+            end
+          end
+        HEREDOC
+      else # MemoWise::InternalAPI::SPLAT, MemoWise::InternalAPI::DOUBLE_SPLAT
+        klass.module_eval <<~HEREDOC, __FILE__, __LINE__ + 1
+          def #{method_name}(#{MemoWise::InternalAPI.args_str(method)})
+            _memo_wise_hash = (@_memo_wise[:#{method_name}] ||= {})
+            _memo_wise_key = #{MemoWise::InternalAPI.key_str(method)}
+            _memo_wise_hash.fetch(_memo_wise_key) do
+              _memo_wise_hash[_memo_wise_key] = #{original_memo_wised_name}(#{MemoWise::InternalAPI.call_str(method)})
+            end
+          end
+        HEREDOC
+      end
+
+      klass.send(visibility, method_name)
+    end
+  end
+
   # @private
   #
   # Private setup method, called automatically by `prepend MemoWise` in a class.
@@ -109,154 +258,7 @@ module MemoWise
   #   end
   #
   def self.prepended(target)
-    class << target
-      # Allocator to set up memoization state before
-      # [calling the original](https://medium.com/@jeremy_96642/ruby-method-auditing-using-module-prepend-4f4e69aacd95)
-      # allocator.
-      #
-      # This is necessary in addition to the `#initialize` method definition
-      # above because
-      # [`Class#allocate`](https://ruby-doc.org/3.2.2/Class.html#method-i-allocate)
-      # bypasses `#initialize`, and when it's used (e.g.,
-      # [in ActiveRecord](https://github.com/rails/rails/blob/a395c3a6af1e079740e7a28994d77c8baadd2a9d/activerecord/lib/active_record/persistence.rb#L411))
-      # we still need to be able to access MemoWise's instance variable. Despite
-      # Ruby documentation indicating otherwise, `Class#new` does not call
-      # `Class#allocate`, so we need to override both.
-      #
-      def allocate
-        MemoWise::InternalAPI.create_memo_wise_state!(super)
-      end
-
-      # NOTE: See YARD docs for {.memo_wise} directly below this method!
-      def memo_wise(method_name_or_hash)
-        klass = self
-        case method_name_or_hash
-        when Symbol
-          method_name = method_name_or_hash
-
-          if klass.singleton_class?
-            MemoWise::InternalAPI.create_memo_wise_state!(
-              MemoWise::InternalAPI.original_class_from_singleton(klass)
-            )
-          end
-
-          # Ensures a module extended by another class/module still works
-          # e.g. rails `ClassMethods` module
-          if klass.is_a?(Module) && !klass.is_a?(Class)
-            # Using `extended` without `included` & `prepended`
-            # As a call to `create_memo_wise_state!` is already included in
-            # `.allocate`/`#initialize`
-            #
-            # But a module/class extending another module with memo_wise
-            # would not call `.allocate`/`#initialize` before calling methods
-            #
-            # On method call `@_memo_wise` would still be `nil`
-            # causing error when fetching cache from `@_memo_wise`
-            klass.singleton_class.prepend(CreateMemoWiseStateOnExtended)
-          end
-        when Hash
-          unless method_name_or_hash.keys == [:self]
-            raise ArgumentError,
-                  "`:self` is the only key allowed in memo_wise"
-          end
-
-          method_name = method_name_or_hash[:self]
-
-          MemoWise::InternalAPI.create_memo_wise_state!(self)
-
-          # In Ruby, "class methods" are implemented as normal instance methods
-          # on the "singleton class" of a given Class object, found via
-          # {Class#singleton_class}.
-          # See: https://medium.com/@leo_hetsch/demystifying-singleton-classes-in-ruby-caf3fa4c9d91
-          klass = klass.singleton_class
-        end
-
-        # This ensures that a memoized method defined on a parent class can
-        # still be used in a child class.
-        if klass.is_a?(Class) && !klass.singleton_class?
-          klass.singleton_class.prepend(CreateMemoWiseStateOnInherited)
-        else
-          klass.prepend(CreateMemoWiseStateOnInherited)
-        end
-
-        raise ArgumentError, "#{method_name.inspect} must be a Symbol" unless method_name.is_a?(Symbol)
-
-        visibility = MemoWise::InternalAPI.method_visibility(klass, method_name)
-        original_memo_wised_name = MemoWise::InternalAPI.original_memo_wised_name(method_name)
-        method = klass.instance_method(method_name)
-
-        klass.send(:alias_method, original_memo_wised_name, method_name)
-        klass.send(:private, original_memo_wised_name)
-
-        method_arguments = MemoWise::InternalAPI.method_arguments(method)
-
-        case method_arguments
-        when MemoWise::InternalAPI::NONE
-          klass.module_eval <<~HEREDOC, __FILE__, __LINE__ + 1
-            def #{method_name}
-              @_memo_wise.fetch(:#{method_name}) do
-                @_memo_wise[:#{method_name}] = #{original_memo_wised_name}
-              end
-            end
-          HEREDOC
-        when MemoWise::InternalAPI::ONE_REQUIRED_POSITIONAL, MemoWise::InternalAPI::ONE_REQUIRED_KEYWORD
-          key = method.parameters.first.last
-          klass.module_eval <<~HEREDOC, __FILE__, __LINE__ + 1
-            def #{method_name}(#{MemoWise::InternalAPI.args_str(method)})
-              _memo_wise_hash = (@_memo_wise[:#{method_name}] ||= {})
-              _memo_wise_hash.fetch(#{key}) do
-                _memo_wise_hash[#{key}] = #{original_memo_wised_name}(#{MemoWise::InternalAPI.call_str(method)})
-              end
-            end
-          HEREDOC
-        when MemoWise::InternalAPI::MULTIPLE_REQUIRED
-          # When we have multiple required params, we store the memoized values in a deeply nested hash, like:
-          # { method_name: { arg1 => { arg2 => { arg3 => memoized_value } } } }
-          last_index = method.parameters.size
-          layers = method.parameters.map.with_index(1) do |(_, name), index|
-            prev_hash = "_memo_wise_hash#{index - 1 if index > 1}"
-            fallback = if index == last_index
-                         "#{original_memo_wised_name}(#{MemoWise::InternalAPI.call_str(method)})"
-                       else
-                         "{}"
-                       end
-            "_memo_wise_hash#{index} = #{prev_hash}.fetch(#{name}) { #{prev_hash}[#{name}] = #{fallback} }"
-          end
-          klass.module_eval <<~HEREDOC, __FILE__, __LINE__ + 1
-            def #{method_name}(#{MemoWise::InternalAPI.args_str(method)})
-              _memo_wise_hash = (@_memo_wise[:#{method_name}] ||= {})
-              #{layers.join("\n  ")}
-            end
-          HEREDOC
-        when MemoWise::InternalAPI::SPLAT_AND_DOUBLE_SPLAT
-          # When we have both *args and **kwargs, we store the memoized values in a deeply nested hash, like:
-          # { method_name: { args => { kwargs => memoized_value } } }
-          klass.module_eval <<~HEREDOC, __FILE__, __LINE__ + 1
-            def #{method_name}(*args, **kwargs)
-              _memo_wise_hash = (@_memo_wise[:#{method_name}] ||= {})
-              _memo_wise_kwargs_hash = _memo_wise_hash.fetch(args) do
-                _memo_wise_hash[args] = {}
-              end
-              _memo_wise_kwargs_hash.fetch(kwargs) do
-                _memo_wise_kwargs_hash[kwargs] = #{original_memo_wised_name}(#{MemoWise::InternalAPI.call_str(method)})
-              end
-            end
-          HEREDOC
-        else # MemoWise::InternalAPI::SPLAT, MemoWise::InternalAPI::DOUBLE_SPLAT
-          klass.module_eval <<~HEREDOC, __FILE__, __LINE__ + 1
-            def #{method_name}(#{MemoWise::InternalAPI.args_str(method)})
-              _memo_wise_hash = (@_memo_wise[:#{method_name}] ||= {})
-              _memo_wise_key = #{MemoWise::InternalAPI.key_str(method)}
-              _memo_wise_hash.fetch(_memo_wise_key) do
-                _memo_wise_hash[_memo_wise_key] = #{original_memo_wised_name}(#{MemoWise::InternalAPI.call_str(method)})
-              end
-            end
-          HEREDOC
-        end
-
-        klass.send(visibility, method_name)
-      end
-    end
+    target.singleton_class.prepend(MemoWiseClassMethods)
 
     unless target.singleton_class?
       # Create class methods to implement .preset_memo_wise and .reset_memo_wise
